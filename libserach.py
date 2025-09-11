@@ -14,6 +14,7 @@ _LEFFINGWELL_MOL = None
 _LEFFINGWELL_BEHAVIOR = None
 _SMI_TO_CIDS_RAW = None
 _SMI_TO_CIDS_CANON = None
+_LEFFINGWELL_FPS = None
 
 
 def _load_data_cached():
@@ -69,6 +70,167 @@ def canonicalize_smiles(smi):
         return Chem.MolToSmiles(mol, isomericSmiles=True)
     except Exception:
         return None
+
+
+def _build_fingerprints_cached(mol_df, radius=2, nBits=2048):
+    """Return a mapping CID -> RDKit fingerprint (cached).
+
+    If RDKit is unavailable this returns an empty dict.
+    """
+    global _LEFFINGWELL_FPS
+    if _LEFFINGWELL_FPS is not None:
+        return _LEFFINGWELL_FPS
+
+    fps = {}
+    if not RDKit_AVAILABLE:
+        _LEFFINGWELL_FPS = fps
+        return fps
+
+    try:
+        from rdkit.Chem import AllChem
+        from rdkit.DataStructs import ExplicitBitVect
+    except Exception:
+        _LEFFINGWELL_FPS = fps
+        return fps
+
+    smi_series = mol_df.get("IsomericSMILES")
+    if smi_series is None:
+        _LEFFINGWELL_FPS = fps
+        return fps
+
+    for cid, smi in smi_series.dropna().items():
+        try:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nBits)
+            fps[cid] = fp
+        except Exception:
+            # skip molecules we can't parse / fingerprint
+            continue
+
+    _LEFFINGWELL_FPS = fps
+    return fps
+
+
+def evaluate_smiles_novelty(smi, top_n=5, similarity_threshold=0.8):
+    """Evaluate how novel a SMILES string is relative to the Leffingwell dataset.
+
+    Returns a dict with the contract:
+      - query: original SMILES string
+      - canonical_smiles: canonicalized SMILES (or None)
+      - is_in_dataset: True if an exact (or canonical) match exists in dataset
+      - matched_cids: list of dataset CIDs that match the query exactly
+      - novel: boolean (True if not present and not similar above threshold)
+      - max_similarity: highest Tanimoto similarity (float) or None if not computed
+      - nearest: list of up to top_n nearest dataset entries as dicts {cid, similarity, IsomericSMILES, name}
+
+    Behavior when RDKit is unavailable:
+      - canonicalization and fingerprint-based similarity are not performed.
+      - novelty reduces to whether the exact SMILES string appears in the dataset.
+    """
+    leffingwell_mol, _ = _load_data_cached()
+
+    result = {
+        "query": smi,
+        "canonical_smiles": None,
+        "is_in_dataset": False,
+        "matched_cids": [],
+        "novel": True,
+        "max_similarity": None,
+        "nearest": [],
+    }
+
+    if smi is None:
+        return result
+
+    # canonicalize when possible
+    canon = canonicalize_smiles(smi)
+    result["canonical_smiles"] = canon
+
+    # Find exact / canonical matches using the cached maps
+    smi_to_cids_raw, smi_to_cids_canon = _build_smiles_maps_cached(leffingwell_mol)
+    smi_map = smi_to_cids_canon if RDKit_AVAILABLE else smi_to_cids_raw
+    key = canon if (RDKit_AVAILABLE and canon is not None) else smi
+    matched = list(smi_map.get(key, []))
+    result["matched_cids"] = matched
+    result["is_in_dataset"] = len(matched) > 0
+
+    if not RDKit_AVAILABLE:
+        # Can't compute similarity; novelty is simply presence/absence
+        result["novel"] = not result["is_in_dataset"]
+        return result
+
+    # RDKit available: compute fingerprint similarity to the dataset
+    try:
+        from rdkit.Chem import AllChem
+        from rdkit.DataStructs import TanimotoSimilarity
+    except Exception:
+        result["novel"] = not result["is_in_dataset"]
+        return result
+
+    # Build query fingerprint
+    try:
+        qmol = Chem.MolFromSmiles(canon if canon is not None else smi)
+        if qmol is None:
+            # unparsable SMILES
+            result["novel"] = not result["is_in_dataset"]
+            return result
+        qfp = AllChem.GetMorganFingerprintAsBitVect(qmol, 2, nBits=2048)
+    except Exception:
+        result["novel"] = not result["is_in_dataset"]
+        return result
+
+    fps = _build_fingerprints_cached(leffingwell_mol)
+    if not fps:
+        result["novel"] = not result["is_in_dataset"]
+        return result
+
+    # Compute similarities
+    sims = []
+    for cid, fp in fps.items():
+        try:
+            sim = float(TanimotoSimilarity(qfp, fp))
+        except Exception:
+            continue
+        sims.append((cid, sim))
+
+    if len(sims) == 0:
+        result["novel"] = not result["is_in_dataset"]
+        return result
+
+    # sort by similarity descending
+    sims.sort(key=lambda x: x[1], reverse=True)
+    result["max_similarity"] = float(sims[0][1])
+
+    nearest = []
+    for cid, sim in sims[:top_n]:
+        row = None
+        if cid in leffingwell_mol.index:
+            mol_row = leffingwell_mol.loc[cid]
+            if isinstance(mol_row, pd.DataFrame):
+                mol_row = mol_row.iloc[0]
+            smi_val = mol_row.get("IsomericSMILES") if hasattr(mol_row, 'get') else mol_row["IsomericSMILES"]
+            name = None
+            if hasattr(mol_row, 'index') and "name" in mol_row.index:
+                name = mol_row.get("name")
+            try:
+                if pd.isna(name):
+                    name = None
+            except Exception:
+                pass
+        else:
+            smi_val = None
+            name = None
+
+        nearest.append({"cid": cid, "similarity": float(sim), "IsomericSMILES": smi_val, "name": name})
+
+    result["nearest"] = nearest
+
+    # Novel if no exact match and highest similarity less than threshold
+    result["novel"] = (not result["is_in_dataset"]) and (result["max_similarity"] < similarity_threshold)
+
+    return result
 
 # leffingwell_mol.head()
 #                MolecularWeight             IsomericSMILES IUPACName                       name
