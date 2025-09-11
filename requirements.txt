@@ -1,0 +1,7 @@
+pyrfume
+numpy
+torch
+pandas
+
+# Optional (recommended for chemical validity and QED reward):
+# conda install -c conda-forge rdkit

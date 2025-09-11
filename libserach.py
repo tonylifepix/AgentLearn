@@ -1,6 +1,74 @@
 import pyrfume
 import numpy as np  # Add if not already imported
 import pandas as pd
+import warnings
+
+try:
+    from rdkit import Chem
+    RDKit_AVAILABLE = True
+except Exception:
+    RDKit_AVAILABLE = False
+
+# Module-level caches to avoid repeated I/O / canonicalization
+_LEFFINGWELL_MOL = None
+_LEFFINGWELL_BEHAVIOR = None
+_SMI_TO_CIDS_RAW = None
+_SMI_TO_CIDS_CANON = None
+
+
+def _load_data_cached():
+    """Load leffingwell datasets and cache them at module level."""
+    global _LEFFINGWELL_MOL, _LEFFINGWELL_BEHAVIOR
+    if _LEFFINGWELL_MOL is None or _LEFFINGWELL_BEHAVIOR is None:
+        _LEFFINGWELL_MOL = pyrfume.load_data("leffingwell/molecules.csv")
+        _LEFFINGWELL_BEHAVIOR = pyrfume.load_data("leffingwell/behavior.csv")
+    return _LEFFINGWELL_MOL, _LEFFINGWELL_BEHAVIOR
+
+
+def _build_smiles_maps_cached(mol_df):
+    """Return (raw_map, canonical_map). Caches results on first build.
+
+    raw_map: mapping from dataset IsomericSMILES string -> [CIDs]
+    canonical_map: same mapping but keys are RDKit-canonicalized SMILES when possible
+    """
+    global _SMI_TO_CIDS_RAW, _SMI_TO_CIDS_CANON
+    if _SMI_TO_CIDS_RAW is not None and _SMI_TO_CIDS_CANON is not None:
+        return _SMI_TO_CIDS_RAW, _SMI_TO_CIDS_CANON
+
+    smi_series = mol_df.get("IsomericSMILES")
+    raw_map = {}
+    canon_map = {}
+    if smi_series is None:
+        _SMI_TO_CIDS_RAW, _SMI_TO_CIDS_CANON = raw_map, canon_map
+        return raw_map, canon_map
+
+    for cid, smi in smi_series.dropna().items():
+        raw_map.setdefault(smi, []).append(cid)
+        if RDKit_AVAILABLE:
+            canon = canonicalize_smiles(smi)
+            key = canon if canon is not None else smi
+            canon_map.setdefault(key, []).append(cid)
+        else:
+            # when RDKit not available the canonical map should just mirror raw_map
+            canon_map.setdefault(smi, []).append(cid)
+
+    _SMI_TO_CIDS_RAW, _SMI_TO_CIDS_CANON = raw_map, canon_map
+    return _SMI_TO_CIDS_RAW, _SMI_TO_CIDS_CANON
+
+
+def canonicalize_smiles(smi):
+    """Return RDKit-canonicalized SMILES or None if cannot be parsed or RDKit unavailable."""
+    if smi is None:
+        return None
+    if not RDKit_AVAILABLE:
+        return None
+    try:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return None
+        return Chem.MolToSmiles(mol, isomericSmiles=True)
+    except Exception:
+        return None
 
 # leffingwell_mol.head()
 #                MolecularWeight             IsomericSMILES IUPACName                       name
@@ -22,8 +90,7 @@ import pandas as pd
 # [5 rows x 113 columns]
 
 def search_smile_by_description(query, top_n=10):
-    leffingwell_mol = pyrfume.load_data("leffingwell/molecules.csv")
-    leffingwell_behavior = pyrfume.load_data("leffingwell/behavior.csv")
+    leffingwell_mol, leffingwell_behavior = _load_data_cached()
     """Return top_n matches as dicts containing IsomericSMILES and name.
 
     query may be a single descriptor string or an iterable/list of descriptor strings.
@@ -87,14 +154,149 @@ def search_smile_by_description(query, top_n=10):
         except Exception:
             pass
 
-        results.append({"IsomericSMILES": smi, "name": name})
+        results.append({"IsomericSMILES": smi, "name": name, "similarity": float(similarities[idx])})
 
     return results
 
 def search_description_by_smiles(query, top_n=10):
-    return None
+    leffingwell_mol, leffingwell_behavior = _load_data_cached()
+
+    def canonicalize_smiles(smi):
+        """Return RDKit-canonicalized SMILES or None if cannot be parsed or RDKit unavailable."""
+        if smi is None:
+            return None
+        if not RDKit_AVAILABLE:
+            return None
+        try:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                return None
+            # Use isomeric SMILES to preserve stereochemistry when present
+            return Chem.MolToSmiles(mol, isomericSmiles=True)
+        except Exception:
+            return None
+
+    # Normalize query into an iterable of SMILES
+    if query is None:
+        return []
+    if isinstance(query, str):
+        query = [query]
+    try:
+        query_set = set(query)
+    except TypeError:
+        return []
+
+    if len(query_set) == 0:
+        return []
+
+    # Build mapping from SMILES (or canonical SMILES when RDKit available)
+    # -> list of CIDs (index of molecules df)
+    smi_series = leffingwell_mol.get("IsomericSMILES")
+    if smi_series is None:
+        return []
+
+    # Use cached mappings when available
+    smi_to_cids_raw, smi_to_cids_canon = _build_smiles_maps_cached(leffingwell_mol)
+    smi_to_cids = smi_to_cids_canon if RDKit_AVAILABLE else smi_to_cids_raw
+
+    # Collect seed CIDs for the provided SMILES. If RDKit is available,
+    # canonicalize the query SMILES before matching against the dataset map.
+    seed_cids = []
+    for smi in query_set:
+        key = smi
+        if RDKit_AVAILABLE:
+            canon = canonicalize_smiles(smi)
+            if canon is not None:
+                key = canon
+        if key in smi_to_cids:
+            seed_cids.extend(smi_to_cids[key])
+
+    if len(seed_cids) == 0:
+        # no matching SMILES in dataset
+        return []
+
+    # Use behavior properties columns
+    properties = list(leffingwell_behavior.columns)
+    # Binary matrix for all stimuli
+    binary_data = (leffingwell_behavior.values.astype(bool)).astype(int)
+
+    # Build a combined mask (logical OR) of the seed CIDs' behavior vectors
+    seed_mask = np.zeros(len(properties), dtype=int)
+    for cid in seed_cids:
+        if cid not in leffingwell_behavior.index:
+            continue
+        row = leffingwell_behavior.loc[cid]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        try:
+            vec = (row.values.astype(bool)).astype(int)
+        except Exception:
+            # If row is not numeric-like, build by column lookup
+            vec = np.array([1 if row.get(p, 0) else 0 for p in properties], dtype=int)
+        seed_mask = np.logical_or(seed_mask, vec)
+    seed_mask = seed_mask.astype(int)
+
+    # Vectorized Jaccard similarity between seed_mask and all rows
+    intersection = np.sum(np.logical_and(binary_data, seed_mask), axis=1)
+    union = np.sum(np.logical_or(binary_data, seed_mask), axis=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarities = np.where(union > 0, intersection / union, 0.0)
+
+    # Sort by similarity descending
+    sorted_idx = np.argsort(similarities)[::-1]
+    cids = leffingwell_behavior.index.values
+
+    results = []
+    for idx in sorted_idx:
+        cid = cids[idx]
+        # skip the seed molecules themselves
+        if cid in seed_cids:
+            continue
+
+        # ensure molecule information exists
+        if cid not in leffingwell_mol.index:
+            continue
+
+        mol_row = leffingwell_mol.loc[cid]
+        if isinstance(mol_row, pd.DataFrame):
+            mol_row = mol_row.iloc[0]
+
+        smi = mol_row.get("IsomericSMILES") if hasattr(mol_row, 'get') else mol_row["IsomericSMILES"]
+        name = None
+        if hasattr(mol_row, 'index') and "name" in mol_row.index:
+            name = mol_row.get("name")
+        try:
+            if pd.isna(name):
+                name = None
+        except Exception:
+            pass
+
+        # get odor properties for this CID as a dict of property->0/1
+        prop_dict = {}
+        if cid in leffingwell_behavior.index:
+            prop_row = leffingwell_behavior.loc[cid]
+            if isinstance(prop_row, pd.DataFrame):
+                prop_row = prop_row.iloc[0]
+            for p in properties:
+                try:
+                    val = prop_row.get(p) if hasattr(prop_row, 'get') else prop_row[p]
+                    prop_dict[p] = int(bool(val))
+                except Exception:
+                    prop_dict[p] = 0
+        else:
+            for p in properties:
+                prop_dict[p] = 0
+
+        results.append({"IsomericSMILES": smi, "name": name, "properties": prop_dict, "similarity": float(similarities[idx])})
+        if len(results) >= top_n:
+            break
+
+    return results
 
 if __name__ == "__main__":
     query = ["floral", "fruity"]
     smiles = search_smile_by_description(query)
     print("Top 10 SMILES for query", query, ":", smiles)
+    query_smi = "CCOC1=CC=CC=C1"
+    desc = search_description_by_smiles(query_smi)
+    print("Top 10 descriptions for SMILES", query_smi, ":", desc)
