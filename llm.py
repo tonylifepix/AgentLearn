@@ -9,6 +9,7 @@ import numpy as np
 from cerebras.cloud.sdk import Cerebras
 
 from libserach import (
+    search_description_by_smiles,
     search_smile_by_description,
     evaluate_smiles_novelty,
     suggest_target_descriptors,
@@ -57,22 +58,23 @@ def generate_random_smiles(max_len=50):
     """
     random_selfies = ""
     # Keep adding random symbols until we reach desired length or an end state
-    while len(sf.split_selfies(random_selfies)) < max_len:
-        random_selfies += random.choice(alphabet)
-        
+    while len(list(sf.split_selfies(random_selfies))) < max_len:
+        token = random.choice(alphabet)
+        random_selfies += token
+
         # Check if the SELFIES can be decoded. If not, backtrack.
         try:
             smiles = sf.decoder(random_selfies)
             # Use RDKit to perform a final sanity check
             mol = Chem.MolFromSmiles(smiles)
             if mol is not None:
-                pass # It's a valid molecule
+                pass  # It's a valid molecule
             else:
                 # If RDKit fails, the selfie is likely incomplete/invalid
-                random_selfies = random_selfies[:-len(random.choice(alphabet))] # simple backtrack
+                random_selfies = random_selfies[:-len(token)]  # backtrack last token
         except Exception:
             # If decoder fails, remove the last added symbol
-             random_selfies = random_selfies[:-len(random.choice(alphabet))] # simple backtrack
+            random_selfies = random_selfies[:-len(token)]  # backtrack last token
 
     # Final decoding
     try:
@@ -140,6 +142,7 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
             "You are an assistant that proposes chemically-plausible SMILES strings which have the requested odor properties. "
             "Return only a JSON array of SMILES strings (e.g. [\"CCO\", \"C1=CC=CC=C1\"]). Do not add extra commentary. "
             "Prefer chemically-plausible molecules; suggest stereochemistry when appropriate."
+            "You have access to two tools: search_smile_by_description and search_description_by_smiles. Use them to ensure the molecules you propose are novel and close to the desired descriptors."
         ),
     }
 
@@ -156,6 +159,47 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         "Constraints: Prefer valid, synthetically plausible molecules; avoid exact matches in Leffingwell; return a JSON array of SMILES only."
     )
 
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_smile_by_description",
+                "strict": True,
+                "description": "A tool that searches for SMILES strings based on valid descriptors for Leffingwell dataset.",
+                "parameters": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid descriptors for Leffingwell dataset."
+                    }
+                    },
+                    "required": ["expression"]
+                }
+        }, 
+        {
+            "type": "function",
+            "function": {
+                "name": "search_description_by_smiles",
+                "strict": True,
+                "description": "A tool that searches for similar molecule and their descriptors based on SMILES strings from Leffingwell dataset.",
+                "parameters": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid SMILES strings"
+                    }
+                    },
+                    "required": ["smiles"]
+                }
+        }
+    ]
+
+    # Register every callable tool once
+    available_functions = {
+        "search_smile_by_description": search_smile_by_description,
+        "search_description_by_smiles": search_description_by_smiles
+    }
+
     iter_count = 0
     while len(generated) < target_n and iter_count < max_iters:
         iter_count += 1
@@ -168,12 +212,46 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         )
         messages = [system_msg, {"role": "user", "content": prompt}]
 
-        try:
-            resp = client.chat.completions.create(messages=messages, model="qwen-3-235b-a22b-thinking-2507", stream=False)
-        except Exception as e:
-            print("LLM call failed:", e)
-            time.sleep(1.0)
-            continue
+        while True:
+            try:
+                resp = client.chat.completions.create(messages=messages, model="qwen-3-235b-a22b-thinking-2507", stream=False, tools=tools)
+            except Exception as e:
+                print("LLM call failed:", e)
+                time.sleep(2.0)
+                continue
+            choice = resp.choices[0].message
+            if choice.tool_calls:
+                function_call = choice.tool_calls[0].function
+                if function_call.name == "search_smile_by_description":
+                    args = function_call.arguments
+                    descs = args["expression"]
+                    if isinstance(descs, list):
+                        try:
+                            tool_result = search_smile_by_description(descs)
+                            tool_content = json.dumps(tool_result)
+                        except Exception as e:
+                            tool_content = json.dumps({"error": str(e)})
+                    else:
+                        tool_content = json.dumps({"error": "Invalid arguments format"})
+                elif function_call.name == "search_description_by_smiles":
+                    args = function_call.arguments
+                    smis = args["smiles"]
+                    if isinstance(smis, list):
+                        try:
+                            tool_result = search_description_by_smiles(smis)
+                            tool_content = json.dumps(tool_result)
+                        except Exception as e:
+                            tool_content = json.dumps({"error": str(e)})
+                    else:
+                        tool_content = json.dumps({"error": "Invalid arguments format"})
+                messages.append({
+                    "role": "tool",
+                    "content": tool_content,
+                    "tool_call_id": choice.tool_calls[0].id
+                })
+            else:
+                # no tool call/ final_response
+                break
 
         # Extract text
         try:
@@ -366,7 +444,8 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
         "role": "system",
         "content": (
             "You are an experiment manager. Given training metrics and example molecules, propose a small set of changes to the next generation pass to improve novelty and validity. "
-            "Reply ONLY with a JSON object containing any of: next_descriptors (array of strings), batch_per_call (int), n_to_generate (int), temperature (float), direct_smiles (array of SMILES)."
+            "Reply ONLY with a JSON object containing any of: next_descriptors (array of strings), batch_per_call (int), n_to_generate (int), temperature (float), direct_smiles (array of SMILES). "
+            "You have access to two tools: search_smile_by_description and search_description_by_smiles. You may use them to inspect dataset similarities before deciding."
         )
     }
 
@@ -379,25 +458,123 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
         })
     }
 
-    try:
-        resp = client.chat.completions.create(messages=[system, user], model="qwen-3-235b-a22b-thinking-2507", stream=False)
-        choice = resp.choices[0].message
+    # Define available tools (mirrors generate_novel_smiles)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_smile_by_description",
+                "strict": True,
+                "description": "A tool that searches for SMILES strings based on valid descriptors for Leffingwell dataset.",
+                "parameters": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid descriptors for Leffingwell dataset."
+                    }
+                },
+                "required": ["expression"]
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_description_by_smiles",
+                "strict": True,
+                "description": "A tool that searches for similar molecule and their descriptors based on SMILES strings from Leffingwell dataset.",
+                "parameters": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid SMILES strings"
+                    }
+                },
+                "required": ["smiles"]
+            }
+        }
+    ]
+
+    messages = [system, user]
+
+    # Multi-turn tool-calling loop similar to generate_novel_smiles
+    while True:
+        try:
+            resp = client.chat.completions.create(
+                messages=messages,
+                model="qwen-3-235b-a22b-thinking-2507",
+                stream=False,
+                tools=tools,
+            )
+        except Exception:
+            # On API failure, return empty suggestion
+            return {}
+
+        choice = getattr(resp.choices[0], 'message', None)
+        if not choice:
+            return {}
+
+        # If model requested a tool, execute it and continue the loop
+        if getattr(choice, 'tool_calls', None):
+            try:
+                call = choice.tool_calls[0]
+                fn = call.function
+                tool_content = json.dumps({"error": "Unknown tool"})
+                if fn.name == "search_smile_by_description":
+                    args = getattr(fn, 'arguments', {})
+                    descs = args.get("expression") if isinstance(args, dict) else None
+                    if isinstance(descs, list):
+                        try:
+                            result = search_smile_by_description(descs)
+                            tool_content = json.dumps(result)
+                        except Exception as e:
+                            tool_content = json.dumps({"error": str(e)})
+                    else:
+                        tool_content = json.dumps({"error": "Invalid arguments format"})
+                elif fn.name == "search_description_by_smiles":
+                    args = getattr(fn, 'arguments', {})
+                    smis = args.get("smiles") if isinstance(args, dict) else None
+                    if isinstance(smis, list):
+                        try:
+                            result = search_description_by_smiles(smis)
+                            tool_content = json.dumps(result)
+                        except Exception as e:
+                            tool_content = json.dumps({"error": str(e)})
+                    else:
+                        tool_content = json.dumps({"error": "Invalid arguments format"})
+
+                messages.append({
+                    "role": "tool",
+                    "content": tool_content,
+                    "tool_call_id": call.id,
+                })
+                # continue loop for another assistant turn
+                continue
+            except Exception:
+                # Fallback: break and try to parse whatever content exists
+                pass
+
+        # No tool call => final content to parse
         text = choice.content or ""
-        # parse JSON
+        text = _strip_think_sections(text)
+        if not text:
+            return {}
+        # Prefer direct JSON object
         try:
             obj = json.loads(text)
             return obj if isinstance(obj, dict) else {}
         except Exception:
-            # try to extract JSON substring
+            # Try to extract JSON object substring
             jmatch = re.search(r"(\{[\s\S]*\})", text)
             if jmatch:
                 try:
-                    return json.loads(jmatch.group(1))
+                    obj = json.loads(jmatch.group(1))
+                    return obj if isinstance(obj, dict) else {}
                 except Exception:
                     return {}
             return {}
-    except Exception:
-        return {}
+
+    # Safety fallback
+    return {}
 
 
 def orchestrate(descriptors: List[str], rounds: int = 3, per_round_target: int = 50):
@@ -506,14 +683,20 @@ def _sample_random_control(n: int) -> List[Dict]:
 
     Returns list of records with minimal metadata matching generated format.
     """
-    smiles = pyrfume.load_data('leffingwell/molecules.csv')
-    if smiles is None or 'IsomericSMILES' not in smiles.columns:
+    smiles_df = pyrfume.load_data('leffingwell/molecules.csv')
+    if smiles_df is None or 'IsomericSMILES' not in smiles_df.columns:
         return []
-    s = smiles['IsomericSMILES'].dropna().astype(str).unique().tolist()
+    candidates = smiles_df['IsomericSMILES'].dropna().astype(str).unique().tolist()
+    import random
+    sampled = random.sample(candidates, min(n, len(candidates)))
     out = []
-    for _ in range(n):
-        smiles = generate_random_smiles(max_len=30)
-        out.append({"smiles": smiles, "valid": train_rl.is_valid_smiles(smiles), "novelty": evaluate_smiles_novelty(smiles), "timestamp": time.time()})
+    for smi in sampled:
+        out.append({
+            "smiles": smi,
+            "valid": train_rl.is_valid_smiles(smi),
+            "novelty": evaluate_smiles_novelty(smi),
+            "timestamp": time.time()
+        })
     return out
 
 
