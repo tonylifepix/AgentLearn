@@ -3,6 +3,7 @@ import numpy as np
 from rdkit import Chem
 import torch
 import pandas as pd
+from torch.utils.data import Dataset
 
 
 def smiles_to_vec(smiles, vector_size=2048):
@@ -17,7 +18,7 @@ def smiles_to_vec(smiles, vector_size=2048):
     return arr.astype(np.float32)
 
 
-class SmilesDataset:
+class SmilesDataset(Dataset):
     def __init__(self, smiles_list, properties):
         self.smiles_list = smiles_list
         self.vectors = [smiles_to_vec(smiles) for smiles in smiles_list]
@@ -69,4 +70,20 @@ if __name__ == "__main__":
     #     if row.get(tag, 0) == 1:
     #         print(f"Setting property for molecule {i}, tag {tag} {row.get(tag, 0)}")
     #     properties[i, tag_to_index[tag]] = 1.0
+    rand_perm = np.random.permutation(np.arange(len(dataset)))
+    smiles_list = [smiles_list[i] for i in rand_perm]
+    properties = properties[rand_perm, :]
+    print(f"SMILES list length: {len(smiles_list)}")
+
     print(f"Properties shape: {properties.shape}")
+    split_idx = int(0.8 * len(dataset))
+    train_dataset = SmilesDataset(smiles_list[:split_idx], properties[:split_idx, :])
+    test_dataset = SmilesDataset(smiles_list[split_idx:], properties[split_idx:, :])
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Test dataset size: {len(test_dataset)}")
+    torch.save(train_dataset, "train_dataset.pt")
+    torch.save(test_dataset, "test_dataset.pt")
+
+    full_training_smiles = train_dataset.smiles_list
+    print(f"Full training SMILES count: {len(full_training_smiles)}")
