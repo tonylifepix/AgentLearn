@@ -7,6 +7,12 @@ import difflib
 import os
 import pickle
 import json
+try:
+    # behavior utilities for odor vectors
+    from libserach import predict_behavior_from_smiles, get_behavior_columns
+    LIBSEARCH_AVAILABLE = True
+except Exception:
+    LIBSEARCH_AVAILABLE = False
 
 try:
     from rdkit import Chem
@@ -418,14 +424,31 @@ if __name__ == "__main__":
         print("\nVerification complete. Install PyTorch to run full training: `pip install torch` (or use conda).\n")
         raise SystemExit(0)
 
-    # Small, easy-to-run configuration
-    NUM_SMILES = 2000  # cap dataset to keep training quick
-    EMBED_SIZE = 64
-    HIDDEN_SIZE = 128
-    BATCH_SIZE = 64
-    PRETRAIN_EPOCHS = 3
-    RL_STEPS = 300
-    LR = 1e-3
+    # Small, easy-to-run configuration (can be overridden via environment variables)
+    NUM_SMILES = int(os.environ.get('NUM_SMILES', 2000))  # cap dataset to keep training quick
+    EMBED_SIZE = int(os.environ.get('EMBED_SIZE', 64))
+    HIDDEN_SIZE = int(os.environ.get('HIDDEN_SIZE', 128))
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 64))
+    PRETRAIN_EPOCHS = int(os.environ.get('PRETRAIN_EPOCHS', 3))
+    RL_STEPS = int(os.environ.get('RL_STEPS', 300))
+    LR = float(os.environ.get('LR', 1e-3))
+
+    # Behavior-target configuration (optional)
+    BEHAVIOR_REWARD_WEIGHT = float(os.environ.get('BEHAVIOR_REWARD_WEIGHT', 0.3))
+    TARGET_BEHAVIOR_VECTOR_JSON = os.environ.get('TARGET_BEHAVIOR_VECTOR_JSON')
+    TARGET_BEHAVIOR_VECTOR = None
+    if TARGET_BEHAVIOR_VECTOR_JSON:
+        try:
+            vec = json.loads(TARGET_BEHAVIOR_VECTOR_JSON)
+            if isinstance(vec, list):
+                TARGET_BEHAVIOR_VECTOR = np.array([float(x) for x in vec], dtype=float)
+        except Exception:
+            TARGET_BEHAVIOR_VECTOR = None
+
+    # Orchestration flags
+    SKIP_PRETRAIN = os.environ.get('SKIP_PRETRAIN', '') in ('1', 'true', 'True')
+    PRETRAIN_ONLY = os.environ.get('PRETRAIN_ONLY', '') in ('1', 'true', 'True')
+    PRETRAIN_SAVE_PATH = os.environ.get('PRETRAIN_SAVE_PATH', os.path.join('checkpoints', 'pretrained.pt'))
 
 
     print("Loading dataset (this uses pyrfume)...")
@@ -539,31 +562,44 @@ if __name__ == "__main__":
         pass
 
     # Pretraining (MLE)
-    print("Starting supervised pretraining (MLE)...")
-    for epoch in range(PRETRAIN_EPOCHS):
-        random.shuffle(indices)
-        t0 = time.time()
-        total_loss = 0.0
-        count = 0
-        for i in range(0, len(indices), BATCH_SIZE):
-            batch_idx = indices[i : i + BATCH_SIZE]
-            batch = [encoded[j] for j in batch_idx]
-            batch_tensor = collate(batch).to(device)
-            inputs = batch_tensor[:, :-1]
-            targets = batch_tensor[:, 1:]
+    if not SKIP_PRETRAIN:
+        print("Starting supervised pretraining (MLE)...")
+        for epoch in range(PRETRAIN_EPOCHS):
+            random.shuffle(indices)
+            t0 = time.time()
+            total_loss = 0.0
+            count = 0
+            for i in range(0, len(indices), BATCH_SIZE):
+                batch_idx = indices[i : i + BATCH_SIZE]
+                batch = [encoded[j] for j in batch_idx]
+                batch_tensor = collate(batch).to(device)
+                inputs = batch_tensor[:, :-1]
+                targets = batch_tensor[:, 1:]
 
-            logits, _ = model(inputs)
-            # flatten
-            logits_flat = logits.reshape(-1, vocab_size)
-            targets_flat = targets.reshape(-1)
-            loss = criterion(logits_flat, targets_flat)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                logits, _ = model(inputs)
+                # flatten
+                logits_flat = logits.reshape(-1, vocab_size)
+                targets_flat = targets.reshape(-1)
+                loss = criterion(logits_flat, targets_flat)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            total_loss += float(loss.item())
-            count += 1
-        print(f"Epoch {epoch+1}/{PRETRAIN_EPOCHS} loss={total_loss/count:.4f} time={time.time()-t0:.1f}s")
+                total_loss += float(loss.item())
+                count += 1
+            print(f"Epoch {epoch+1}/{PRETRAIN_EPOCHS} loss={total_loss/count:.4f} time={time.time()-t0:.1f}s")
+        # If caller requested pretraining only, save and exit
+        if PRETRAIN_ONLY:
+            try:
+                os.makedirs(os.path.dirname(PRETRAIN_SAVE_PATH), exist_ok=True)
+                save_checkpoint(PRETRAIN_SAVE_PATH, model, optimizer, replay, step=0)
+                print(f"Saved pretrained checkpoint to {PRETRAIN_SAVE_PATH}")
+            except Exception as e:
+                print("Warning: failed to save pretrained checkpoint:", e)
+            print("PRETRAIN_ONLY set: exiting after pretraining.")
+            raise SystemExit(0)
+    else:
+        print("SKIP_PRETRAIN set: skipping supervised pretraining (assume pretrained checkpoint will be loaded)")
 
     # Show some samples before RL
     print("Example molecules (before RL):")
@@ -574,6 +610,8 @@ if __name__ == "__main__":
     print("Starting REINFORCE fine-tuning...")
     PENALTY_WEIGHT = 0.8  # weight for multiplicative penalty on reward
     NOVELTY_WEIGHT = 0.2  # additive novelty reward weight
+    # Cache for predicted behavior vectors to avoid recomputing
+    behavior_cache = {}
     for step in range(RL_STEPS):
         # Sample a batch of molecules
         model.train()
@@ -639,7 +677,36 @@ if __name__ == "__main__":
                 # if buffer empty, treat as maximally novel
                 novelty = 1.0
 
-            reward = float(max(0.0, min(1.0, reward_basic + NOVELTY_WEIGHT * novelty)))
+            # behavior match reward component (optional)
+            beh_bonus = 0.0
+            if LIBSEARCH_AVAILABLE and TARGET_BEHAVIOR_VECTOR is not None and TARGET_BEHAVIOR_VECTOR.size > 0:
+                try:
+                    if sampled in behavior_cache:
+                        pred = behavior_cache[sampled]
+                    else:
+                        pred = predict_behavior_from_smiles(sampled, top_k=5)
+                        behavior_cache[sampled] = pred
+                    # align sizes cautiously
+                    if isinstance(pred, np.ndarray) and pred.size == TARGET_BEHAVIOR_VECTOR.size and pred.size > 0:
+                        # similarity between predicted and target vectors: use Jaccard-style on binarized, fallback to cosine
+                        # binarize by 0.5 threshold
+                        pb = (pred >= 0.5).astype(int)
+                        tb = (TARGET_BEHAVIOR_VECTOR >= 0.5).astype(int)
+                        inter = float(np.logical_and(pb == 1, tb == 1).sum())
+                        union = float(np.logical_or(pb == 1, tb == 1).sum())
+                        if union > 0:
+                            beh_sim = inter / union
+                        else:
+                            # both zero vectors -> treat as neutral
+                            beh_sim = 0.0
+                        # small cosine fallback if both vectors dense
+                        if union == 0 and float(np.linalg.norm(pred) * np.linalg.norm(TARGET_BEHAVIOR_VECTOR)) > 0:
+                            beh_sim = float(np.dot(pred, TARGET_BEHAVIOR_VECTOR) / (np.linalg.norm(pred) * np.linalg.norm(TARGET_BEHAVIOR_VECTOR)))
+                        beh_bonus = float(max(0.0, min(1.0, beh_sim))) * BEHAVIOR_REWARD_WEIGHT
+                except Exception:
+                    beh_bonus = 0.0
+
+            reward = float(max(0.0, min(1.0, reward_basic + NOVELTY_WEIGHT * novelty + beh_bonus)))
             reward = max(0.0, min(1.0, reward))
             batch_samples.append((sampled_tokens, sampled))
             batch_logp.append(sampled_logp)

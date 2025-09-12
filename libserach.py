@@ -455,6 +455,183 @@ def search_description_by_smiles(query, top_n=10):
 
     return results
 
+def get_behavior_columns():
+    """Return the ordered list of odor descriptor names (behavior columns)."""
+    _, leffingwell_behavior = _load_data_cached()
+    if leffingwell_behavior is None:
+        return []
+    return list(leffingwell_behavior.columns)
+
+
+def vector_from_descriptors(descriptors):
+    """Build a 0/1 numpy vector aligned to behavior columns from a list of descriptor names."""
+    _, leffingwell_behavior = _load_data_cached()
+    if leffingwell_behavior is None:
+        return np.array([], dtype=float)
+    cols = list(leffingwell_behavior.columns)
+    s = set(descriptors or [])
+    vec = np.array([1.0 if c in s else 0.0 for c in cols], dtype=float)
+    return vec
+
+
+def predict_behavior_from_smiles(smi, top_k=5):
+    """Predict a behavior vector for a SMILES by KNN over Leffingwell molecules using Tanimoto.
+
+    Returns a numpy array of length = number of behavior columns with values in [0,1].
+    Requires RDKit. If RDKit unavailable or parsing fails, returns a zero vector.
+    """
+    leffingwell_mol, leffingwell_behavior = _load_data_cached()
+    if leffingwell_behavior is None:
+        return np.array([], dtype=float)
+    num_props = leffingwell_behavior.shape[1]
+    if not RDKit_AVAILABLE or smi is None:
+        return np.zeros(num_props, dtype=float)
+
+    # Build cached fingerprints for all dataset molecules
+    fps = _build_fingerprints_cached(leffingwell_mol)
+    if not fps:
+        return np.zeros(num_props, dtype=float)
+
+    try:
+        from rdkit.Chem import AllChem
+        from rdkit.DataStructs import TanimotoSimilarity
+    except Exception:
+        return np.zeros(num_props, dtype=float)
+
+    # Build query fingerprint (use canonicalized if available)
+    qcanon = canonicalize_smiles(smi)
+    try:
+        qmol = Chem.MolFromSmiles(qcanon if qcanon is not None else smi)
+        if qmol is None:
+            return np.zeros(num_props, dtype=float)
+        qfp = AllChem.GetMorganFingerprintAsBitVect(qmol, 2, nBits=2048)
+    except Exception:
+        return np.zeros(num_props, dtype=float)
+
+    # Compute similarities (could be large; optionally cap to a sample for speed)
+    sims = []
+    for cid, fp in fps.items():
+        try:
+            sim = float(TanimotoSimilarity(qfp, fp))
+        except Exception:
+            continue
+        if sim > 0.0:
+            sims.append((cid, sim))
+
+    if len(sims) == 0:
+        return np.zeros(num_props, dtype=float)
+
+    sims.sort(key=lambda x: x[1], reverse=True)
+    top = sims[: max(1, int(top_k))]
+    weights = np.array([s for _, s in top], dtype=float)
+    wsum = float(weights.sum())
+    if wsum <= 0:
+        return np.zeros(num_props, dtype=float)
+    weights = weights / wsum
+
+    # Weighted average of behavior rows
+    props = np.zeros(num_props, dtype=float)
+    cols = list(leffingwell_behavior.columns)
+    for (cid, _w), wnorm in zip(top, weights):
+        if cid not in leffingwell_behavior.index:
+            continue
+        row = leffingwell_behavior.loc[cid]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        try:
+            vec = (row.values.astype(float)).astype(float)
+        except Exception:
+            vec = np.array([float(row.get(c, 0)) for c in cols], dtype=float)
+        props += wnorm * vec
+
+    # Clamp to [0,1]
+    props = np.clip(props, 0.0, 1.0)
+    return props
+
+def compute_descriptor_frequencies():
+    """Compute frequency (count) of each odor descriptor across the Leffingwell behavior dataset.
+
+    Returns an ordered dict-like (list of tuples) of (descriptor, count) sorted by count descending.
+    """
+    leffingwell_mol, leffingwell_behavior = _load_data_cached()
+    if leffingwell_behavior is None:
+        return []
+    # Sum each column (they are binary 0/1) to get counts
+    try:
+        counts = leffingwell_behavior.sum(axis=0)
+        # Convert to list of (descriptor, count)
+        freq_list = [(str(col), int(counts[col])) for col in leffingwell_behavior.columns]
+        # sort by count descending
+        freq_list.sort(key=lambda x: x[1], reverse=True)
+        return freq_list
+    except Exception:
+        # fallback: compute manually
+        props = list(leffingwell_behavior.columns)
+        freq_list = []
+        for p in props:
+            try:
+                col = leffingwell_behavior[p]
+                c = int((col.astype(bool)).sum())
+            except Exception:
+                c = 0
+            freq_list.append((p, c))
+        freq_list.sort(key=lambda x: x[1], reverse=True)
+        return freq_list
+
+
+def suggest_target_descriptors(n_suggestions: int = 5, comb_max_size: int = 2):
+    """Suggest underrepresented descriptor combinations to target.
+
+    Strategy:
+      - Compute single-descriptor frequencies and take the least frequent descriptors as seeds.
+      - Optionally expand to low-frequency pairs (comb_max_size=2) by counting co-occurrences.
+    Returns a list of descriptor-lists (each inner list is a suggested target vector).
+    """
+    # Load behavior table
+    leffingwell_mol, leffingwell_behavior = _load_data_cached()
+    if leffingwell_behavior is None:
+        return []
+
+    props = list(leffingwell_behavior.columns)
+    # compute single frequencies
+    freq = compute_descriptor_frequencies()
+    # freq sorted desc; invert to ascending to find least frequent
+    freq_asc = sorted(freq, key=lambda x: x[1])
+    suggestions = []
+
+    # First, suggest single rare descriptors
+    singles = [p for p, _ in freq_asc][:max(n_suggestions, 1)]
+    for s in singles[:n_suggestions]:
+        suggestions.append([s])
+        if len(suggestions) >= n_suggestions:
+            return suggestions
+
+    # If still need suggestions and comb_max_size >= 2, compute pair co-occurrences
+    if comb_max_size >= 2:
+        # build numpy matrix for quick co-counts
+        try:
+            mat = (leffingwell_behavior.values.astype(bool)).astype(int)
+            prop_idx = {p: i for i, p in enumerate(props)}
+            pair_counts = []
+            # consider pairs from the rarest 20 descriptors to keep compute light
+            rare_candidates = [p for p, _ in freq_asc][:min(20, len(props))]
+            for i in range(len(rare_candidates)):
+                for j in range(i + 1, len(rare_candidates)):
+                    a = prop_idx[rare_candidates[i]]
+                    b = prop_idx[rare_candidates[j]]
+                    cnt = int(((mat[:, a] == 1) & (mat[:, b] == 1)).sum())
+                    pair_counts.append(((rare_candidates[i], rare_candidates[j]), cnt))
+            # sort by ascending count (rarest first)
+            pair_counts.sort(key=lambda x: x[1])
+            for (a, b), c in pair_counts:
+                suggestions.append([a, b])
+                if len(suggestions) >= n_suggestions:
+                    break
+        except Exception:
+            pass
+
+    return suggestions[:n_suggestions]
+
 if __name__ == "__main__":
     query = ["floral", "fruity"]
     smiles = search_smile_by_description(query)

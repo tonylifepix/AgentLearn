@@ -8,7 +8,14 @@ import pyrfume
 import numpy as np
 from cerebras.cloud.sdk import Cerebras
 
-from libserach import search_smile_by_description, evaluate_smiles_novelty
+from libserach import (
+    search_smile_by_description,
+    evaluate_smiles_novelty,
+    suggest_target_descriptors,
+    compute_descriptor_frequencies,
+    get_behavior_columns,
+    vector_from_descriptors,
+)
 import train_rl
 import subprocess
 import shlex
@@ -73,15 +80,29 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         ),
     }
 
+    # Compute behavior vector for descriptors and include it for precise conditioning
+    behavior_cols = get_behavior_columns()
+    target_vec = vector_from_descriptors(descriptors)
+    target_vec_list = target_vec.tolist() if isinstance(target_vec, np.ndarray) else []
+
     prompt_template = (
-        "Generate {n} distinct SMILES strings that likely smell like: {desc}. "
-        "Try to propose molecules that are not in the Leffingwell dataset. Return a JSON array of SMILES only."
+        "Generate {n} distinct SMILES strings whose odor behavior matches the target as closely as possible.\n"
+        "Target descriptors: {desc}\n"
+        "Behavior vector (length {d} in this exact column order) = {vec}\n"
+        "Columns: {cols}\n"
+        "Constraints: Prefer valid, synthetically plausible molecules; avoid exact matches in Leffingwell; return a JSON array of SMILES only."
     )
 
     iter_count = 0
     while len(generated) < target_n and iter_count < max_iters:
         iter_count += 1
-        prompt = prompt_template.format(n=batch_per_call, desc=", ".join(descriptors))
+        prompt = prompt_template.format(
+            n=batch_per_call,
+            desc=", ".join(descriptors),
+            d=len(behavior_cols),
+            vec=json.dumps(target_vec_list),
+            cols=json.dumps(behavior_cols),
+        )
         messages = [system_msg, {"role": "user", "content": prompt}]
 
         try:
@@ -193,6 +214,12 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         # Set env var so train_rl.load_smiles will include these generated smiles
         env = os.environ.copy()
         env["GENERATED_SMILES_FILE"] = os.path.abspath(out_path)
+        # pass target behavior vector and descriptors for RL behavior reward
+        try:
+            env["TARGET_BEHAVIOR_VECTOR_JSON"] = json.dumps(target_vec_list)
+            env["TARGET_DESCRIPTORS"] = ",".join(descriptors)
+        except Exception:
+            pass
         cmd = f"python {os.path.join(os.getcwd(), 'train_rl.py')}"
         print("Starting RL training subprocess (this will run train_rl.py in a new terminal)")
         try:
@@ -317,6 +344,16 @@ def orchestrate(descriptors: List[str], rounds: int = 3, per_round_target: int =
     all_generated = []
 
     current_descriptors = descriptors
+    # If no descriptors provided, auto-suggest underrepresented descriptor combos
+    if not current_descriptors:
+        try:
+            suggestions = suggest_target_descriptors(n_suggestions=3, comb_max_size=2)
+            if suggestions:
+                # pick the first suggestion as initial target
+                current_descriptors = suggestions[0]
+                print(f"Auto-selected target descriptors from dataset analysis: {current_descriptors}")
+        except Exception as e:
+            print("Failed to auto-select descriptors:", e)
     for r in range(rounds):
         print(f"=== Round {r+1}/{rounds}: descriptors={current_descriptors} ===")
         gen = generate_novel_smiles(current_descriptors, target_n=per_round_target, batch_per_call=5, run_training=False)
@@ -329,6 +366,16 @@ def orchestrate(descriptors: List[str], rounds: int = 3, per_round_target: int =
 
         env = os.environ.copy()
         env["GENERATED_SMILES_FILE"] = out_path
+        # Provide target behavior vector for RL reward
+        try:
+            behavior_cols = get_behavior_columns()
+            target_vec = vector_from_descriptors(current_descriptors)
+            env["TARGET_BEHAVIOR_VECTOR_JSON"] = json.dumps(target_vec.tolist())
+            # allow tuning weight via env if set externally; default is defined in train_rl
+            if "BEHAVIOR_REWARD_WEIGHT" not in env:
+                env["BEHAVIOR_REWARD_WEIGHT"] = "0.3"
+        except Exception:
+            pass
 
         print("Running training with newly generated molecules...")
         res = _run_training_and_capture(env)
@@ -377,7 +424,162 @@ def main():
     # novel_count = len(generated)
     # print(f"Generation complete: collected {novel_count} novel molecules for descriptors={descriptors}")
 
-    orchestrate(['Noctua fans','Steam deck'], rounds=3, per_round_target=50)
+    # To run the adaptive orchestration with comparison, call run_controlled_experiment()
+    run_controlled_experiment(
+        descriptors=['Noctua fans', 'Steam deck'],
+        llm_rounds=10,
+        per_round_target=20,
+        control_n=200,
+    )
+
+
+def _sample_random_control(n: int) -> List[Dict]:
+    """Sample n random SMILES from the dataset without any rejection filtering.
+
+    Returns list of records with minimal metadata matching generated format.
+    """
+    init()
+    smiles = pyrfume.load_data('leffingwell/molecules.csv')
+    if smiles is None or 'IsomericSMILES' not in smiles.columns:
+        return []
+    s = smiles['IsomericSMILES'].dropna().astype(str).unique().tolist()
+    import random
+    sampled = random.sample(s, min(n, len(s)))
+    out = []
+    for smi in sampled:
+        out.append({"smiles": smi, "valid": train_rl.is_valid_smiles(smi), "novelty": evaluate_smiles_novelty(smi), "timestamp": time.time()})
+    return out
+
+
+def _compute_validity_novelty(records: List[Dict]) -> Dict[str, float]:
+    """Compute simple validity and novelty metrics from a list of record dicts.
+
+    Each record is expected to have keys:
+      - 'valid': bool
+      - 'novelty': dict with a boolean-like 'novel' field (fallbacks handled)
+    """
+    n = len(records)
+    valid = sum(1 for r in records if bool(r.get('valid')))
+    novel = 0
+    for r in records:
+        nov = r.get('novelty')
+        is_novel = False
+        if isinstance(nov, dict):
+            # prefer 'novel', but fall back to common alternatives if present
+            for k in ('novel', 'is_novel', 'novelty'):
+                if k in nov:
+                    try:
+                        is_novel = bool(nov.get(k))
+                    except Exception:
+                        is_novel = False
+                    break
+        novel += 1 if is_novel else 0
+    return {
+        'n': n,
+        'valid': valid,
+        'novel': novel,
+        'valid_rate': (valid / n) if n else 0.0,
+        'novel_rate': (novel / n) if n else 0.0,
+    }
+
+
+def run_controlled_experiment(descriptors: List[str], llm_rounds: int = 2, per_round_target: int = 50, control_n: int = 150):
+    """Run a control-group experiment:
+      1) Create a pretrained checkpoint (PRETRAIN_ONLY)
+      2) Run the LLM-orchestrated pipeline starting from that checkpoint
+      3) Run a control pipeline that uses `control_n` random SMILES (no rejection)
+      4) Compare final metrics from both runs
+    """
+    # 1) Create pretrained checkpoint
+    pretrain_ckpt = os.path.abspath(os.path.join('checkpoints', 'pretrained.pt'))
+    env = os.environ.copy()
+    env['PRETRAIN_ONLY'] = '1'
+    env['PRETRAIN_SAVE_PATH'] = pretrain_ckpt
+    env['NUM_SMILES'] = str(2000)
+    print("Creating pretrained checkpoint (this will run train_rl.py PRETRAIN_ONLY)...")
+    res = _run_training_and_capture(env, timeout=60*60)
+    print("Pretraining stdout (truncated):\n", '\n'.join(res['stdout'].splitlines()[-20:]))
+
+    # 2) LLM-orchestrated run: set SKIP_PRETRAIN so train_rl uses pretrained checkpoint
+    print("Starting LLM-orchestrated experiment from pretrained checkpoint...")
+    llm_out_path = os.path.abspath('generated_llm.json')
+    os.environ['GENERATED_SMILES_FILE'] = llm_out_path
+    all_generated = []
+    current_desc = descriptors
+    client = Cerebras(api_key=os.environ.get("CEREBRAS_API_KEY"))
+    for r in range(llm_rounds):
+        gen = generate_novel_smiles(current_desc, target_n=per_round_target, batch_per_call=5, run_training=False)
+        all_generated.extend(gen)
+        with open(llm_out_path, 'w') as f:
+            json.dump(all_generated, f, indent=2)
+
+    env_llm = os.environ.copy()
+    env_llm['GENERATED_SMILES_FILE'] = llm_out_path
+    env_llm['SKIP_PRETRAIN'] = '1'
+    env_llm['PRETRAIN_SAVE_PATH'] = pretrain_ckpt
+    # Provide behavior target vector for RL conditioning
+    try:
+        from libserach import vector_from_descriptors
+        tgt_vec = vector_from_descriptors(current_desc)
+        env_llm['TARGET_BEHAVIOR_VECTOR_JSON'] = json.dumps(tgt_vec.tolist())
+        if 'BEHAVIOR_REWARD_WEIGHT' not in env_llm:
+            env_llm['BEHAVIOR_REWARD_WEIGHT'] = '0.3'
+    except Exception:
+        pass
+    # ensure train_rl.load_checkpoint picks up pretrained checkpoint by loading it into latest.pt
+    try:
+        import shutil
+        os.makedirs('checkpoints', exist_ok=True)
+        shutil.copy(pretrain_ckpt, os.path.join('checkpoints', 'latest.pt'))
+    except Exception:
+        pass
+    res_llm = _run_training_and_capture(env_llm)
+    metrics_llm = res_llm.get('metrics', {})
+    print("LLM experiment metrics:", metrics_llm)
+
+    # 3) Control: random sample, no rejection
+    print(f"Creating control group of {control_n} random molecules (no rejection)...")
+    control_list = _sample_random_control(control_n)
+    control_path = os.path.abspath('generated_control.json')
+    with open(control_path, 'w') as f:
+        json.dump(control_list, f, indent=2)
+
+    env_ctrl = os.environ.copy()
+    env_ctrl['GENERATED_SMILES_FILE'] = control_path
+    env_ctrl['SKIP_PRETRAIN'] = '1'
+    # ensure starting from same pretrained checkpoint
+    try:
+        shutil.copy(pretrain_ckpt, os.path.join('checkpoints', 'latest.pt'))
+    except Exception:
+        pass
+    res_ctrl = _run_training_and_capture(env_ctrl)
+    metrics_ctrl = res_ctrl.get('metrics', {})
+    print("Control experiment metrics:", metrics_ctrl)
+
+    # Compute and display validity and novelty for both generated sets
+    llm_gen_metrics = _compute_validity_novelty(all_generated)
+    ctrl_gen_metrics = _compute_validity_novelty(control_list)
+    print("\n=== Generation quality (validity/novelty) ===")
+    print(
+        "LLM generated: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(
+            **llm_gen_metrics
+        )
+    )
+    print(
+        "Control sample: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(
+            **ctrl_gen_metrics
+        )
+    )
+
+    # 4) Compare
+    print("\n=== Comparison ===")
+    print("LLM experiment final_avg_reward:", metrics_llm.get('final_avg_reward'))
+    print("Control experiment final_avg_reward:", metrics_ctrl.get('final_avg_reward'))
+    print("LLM novelty_buf:", metrics_llm.get('novelty_buf'))
+    print("Control novelty_buf:", metrics_ctrl.get('novelty_buf'))
+    print("LLM examples_after_rl (sample):", metrics_llm.get('examples_after_rl', [])[:5])
+    print("Control examples_after_rl (sample):", metrics_ctrl.get('examples_after_rl', [])[:5])
 
 if __name__ == "__main__":
+    init()
     main()
