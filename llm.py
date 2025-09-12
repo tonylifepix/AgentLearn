@@ -22,6 +22,9 @@ import shlex
 import threading
 import io
 import re
+import selfies as sf
+from rdkit import Chem
+import random
 
 
 SMI_TOKEN_RE = re.compile(r"[A-Za-z0-9@+\-\[\]\(\)=#\\/\\]+")
@@ -43,6 +46,66 @@ def _extract_smiles(text: str) -> List[str]:
         seen.add(s)
         out.append(s)
     return out
+
+# Define the SELFIES alphabet (can be derived from a dataset)
+alphabet = sf.get_semantic_robust_alphabet()
+alphabet = list(alphabet) # Convert set to list
+
+def generate_random_smiles(max_len=50):
+    """
+    Generates a random valid SMILES string using SELFIES.
+    """
+    random_selfies = ""
+    # Keep adding random symbols until we reach desired length or an end state
+    while len(sf.split_selfies(random_selfies)) < max_len:
+        random_selfies += random.choice(alphabet)
+        
+        # Check if the SELFIES can be decoded. If not, backtrack.
+        try:
+            smiles = sf.decoder(random_selfies)
+            # Use RDKit to perform a final sanity check
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                pass # It's a valid molecule
+            else:
+                # If RDKit fails, the selfie is likely incomplete/invalid
+                random_selfies = random_selfies[:-len(random.choice(alphabet))] # simple backtrack
+        except Exception:
+            # If decoder fails, remove the last added symbol
+             random_selfies = random_selfies[:-len(random.choice(alphabet))] # simple backtrack
+
+    # Final decoding
+    try:
+        final_smiles = sf.decoder(random_selfies)
+        # Final check with RDKit
+        if Chem.MolFromSmiles(final_smiles):
+            return final_smiles
+        else:
+            return None # Failed to generate a valid one
+    except Exception:
+        return None
+
+
+
+def _strip_think_sections(text: str) -> str:
+    """Remove any <think>...</think> sections some chat models include.
+
+    This helps ensure cleaner JSON parsing and SMILES extraction.
+    """
+    if not text:
+        return text
+    try:
+        # If there's any closing </think> tag, return only the content after the last one.
+        closes = list(re.finditer(r"</think\s*>", text, flags=re.IGNORECASE))
+        if closes:
+            text = text[closes[-1].end():]
+        else:
+            # Otherwise strip any <think>...</think> sections if present (safe fallback).
+            text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    except Exception:
+        # If regex fails for any reason, return original text
+        return text
+    return text.strip()
 
 
 def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per_call: int = 5, max_iters: int = 1000, run_training: bool = False):
@@ -106,7 +169,7 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         messages = [system_msg, {"role": "user", "content": prompt}]
 
         try:
-            resp = client.chat.completions.create(messages=messages, model="qwen-3-235b-a22b-thinking-2507")
+            resp = client.chat.completions.create(messages=messages, model="qwen-3-235b-a22b-thinking-2507", stream=False)
         except Exception as e:
             print("LLM call failed:", e)
             time.sleep(1.0)
@@ -119,11 +182,16 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         except Exception:
             text = ""
 
+        # Strip any hidden/auxiliary "think" sections to avoid jamming JSON parsing
+        text = _strip_think_sections(text)
+
         # Try parse JSON array first
         candidates: List[str] = []
         if text:
             try:
                 parsed = json.loads(text)
+                # Note: any <think> sections have been stripped above.
+                
                 if isinstance(parsed, list):
                     candidates = [str(x).strip() for x in parsed if isinstance(x, str)]
             except Exception:
@@ -312,7 +380,7 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
     }
 
     try:
-        resp = client.chat.completions.create(messages=[system, user], model="qwen-3-235b-a22b-thinking-2507")
+        resp = client.chat.completions.create(messages=[system, user], model="qwen-3-235b-a22b-thinking-2507", stream=False)
         choice = resp.choices[0].message
         text = choice.content or ""
         # parse JSON
@@ -438,16 +506,14 @@ def _sample_random_control(n: int) -> List[Dict]:
 
     Returns list of records with minimal metadata matching generated format.
     """
-    init()
     smiles = pyrfume.load_data('leffingwell/molecules.csv')
     if smiles is None or 'IsomericSMILES' not in smiles.columns:
         return []
     s = smiles['IsomericSMILES'].dropna().astype(str).unique().tolist()
-    import random
-    sampled = random.sample(s, min(n, len(s)))
     out = []
-    for smi in sampled:
-        out.append({"smiles": smi, "valid": train_rl.is_valid_smiles(smi), "novelty": evaluate_smiles_novelty(smi), "timestamp": time.time()})
+    for _ in range(n):
+        smiles = generate_random_smiles(max_len=30)
+        out.append({"smiles": smiles, "valid": train_rl.is_valid_smiles(smiles), "novelty": evaluate_smiles_novelty(smiles), "timestamp": time.time()})
     return out
 
 
