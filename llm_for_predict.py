@@ -3,9 +3,10 @@ import os
 import json
 import re
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import pyrfume
 import numpy as np
+import pandas as pd
 from cerebras.cloud.sdk import Cerebras
 
 from libserach import (
@@ -17,6 +18,7 @@ from libserach import (
     get_behavior_columns,
     vector_from_descriptors,
 )
+# Keep RL utilities for validity checks but do not run RL training anymore
 import train_rl
 import subprocess
 import shlex
@@ -26,6 +28,16 @@ import re
 import selfies as sf
 from rdkit import Chem
 import random
+
+# Import predictor components to enable retraining here
+from leffingwell_odor_model import (
+    Config as PredictorConfig,
+    SmilesFeaturizer,
+    MLP,
+    load_leffingwell_dataframe,
+    split_df,
+    evaluate as evaluate_predictor,
+)
 
 
 SMI_TOKEN_RE = re.compile(r"[A-Za-z0-9@+\-\[\]\(\)=#\\/\\]+")
@@ -110,14 +122,13 @@ def _strip_think_sections(text: str) -> str:
     return text.strip()
 
 
-def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per_call: int = 5, max_iters: int = 1000, run_training: bool = False):
-    """Generate novel SMILES with given odor descriptors using the LLM, verify novelty, and save results.
+def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per_call: int = 5, max_iters: int = 1000):
+    """Generate novel SMILES using the LLM, verify novelty, label by nearest neighbor, and save results.
 
-    - descriptors: list of odor terms (must be from leffingwell vocabulary or similar)
+    - descriptors: list of odor terms (Leffingwell vocabulary preferred)
     - target_n: desired number of novel molecules to collect
     - batch_per_call: ask the LLM to propose this many SMILES per request
     - max_iters: safety cap on LLM calls
-    - run_training: if True, after generation will kick off `train_rl.py` as a subprocess
     """
     init()
     client = Cerebras(api_key=os.environ.get("CEREBRAS_API_KEY"))
@@ -125,36 +136,27 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
     # prepare storage
     generated: List[Dict] = []
     generated_set = set()
-    replay = train_rl.ReplayBuffer(max_size=2000)
-
-    # preload replay with any existing checkpoint (so novelty uses current buffer)
-    # attempt to load existing checkpoint so replay buffer gets populated
-    ckpt_path = os.path.join("checkpoints", "latest.pt")
-    try:
-        _ = train_rl.load_checkpoint(ckpt_path, model=None, optimizer=None, replay=replay)
-    except Exception:
-        pass
 
     # Build a short system prompt guiding the LLM to output SMILES in JSON array form
     system_msg = {
         "role": "system",
         "content": (
-            "You are an assistant that proposes chemically-plausible SMILES strings which have the requested odor properties. "
+            "You are a chemistry assistant that proposes chemically plausible, synthesizable SMILES strings for molecules that is similar to the most unique molecule in the dataset. "
             "Return only a JSON array of SMILES strings (e.g. [\"CCO\", \"C1=CC=CC=C1\"]). Do not add extra commentary. "
             "Prefer chemically-plausible molecules; suggest stereochemistry when appropriate."
-            "You have access to two tools: search_smile_by_description and search_description_by_smiles. Use them to ensure the molecules you propose are novel and close to the desired descriptors."
+            "You may call tools: "
+            "search_smile_by_description(descriptors) to explore known molecules matching the target descriptors;"
+            "search_description_by_smiles(smiles) to inspect dataset neighbors of candidates;"
+            "Avoid returning any SMILES that exactly match the Leffingwell dataset or are near-duplicates of your own suggestions. If no suitable options, generate another batch and try again."
         ),
     }
 
     # Compute behavior vector for descriptors and include it for precise conditioning
     behavior_cols = get_behavior_columns()
-    target_vec = vector_from_descriptors(descriptors)
-    target_vec_list = target_vec.tolist() if isinstance(target_vec, np.ndarray) else []
 
     prompt_template = (
-        "Generate {n} distinct SMILES strings whose odor behavior matches the target as closely as possible.\n"
-        "Target descriptors: {desc}\n"
-        "Behavior vector (length {d} in this exact column order) = {vec}\n"
+        "Generate {n} distinct SMILES strings for molecules similar to the most unique molecule. You can use the tools to find the most unique molecule.\n"
+        "For each molecules you suggest verify the SMILES,\n"
         "Columns: {cols}\n"
         "Constraints: Prefer valid, synthetically plausible molecules; avoid exact matches in Leffingwell; return a JSON array of SMILES only."
     )
@@ -206,6 +208,65 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
         "search_description_by_smiles": search_description_by_smiles
     }
 
+    behavior_cols = get_behavior_columns()
+    # Cache datasets for fallback lookups without RDKit
+    _mol_df = None
+    _beh_df = None
+
+    def _ensure_dfs():
+        nonlocal _mol_df, _beh_df
+        if _mol_df is None or _beh_df is None:
+            try:
+                _mol_df = pyrfume.load_data('leffingwell/molecules.csv')
+                _beh_df = pyrfume.load_data('leffingwell/behavior.csv')
+            except Exception:
+                _mol_df, _beh_df = None, None
+
+    def _assign_properties_from_nearest(smi: str, desired_desc: List[str]) -> Tuple[Dict[str, int], List[float]]:
+        """Label a SMILES using the odor properties of the most similar dataset molecule.
+
+        Returns (properties_dict, label_vector_aligned_to_behavior_cols).
+        If no neighbor found, returns empty dict and zero vector.
+        """
+        props_dict: Dict[str, int] = {}
+        # First try RDKit-based nearest neighbor via novelty helper
+        try:
+            nov = evaluate_smiles_novelty(smi, top_n=1)
+            nearest = (nov or {}).get('nearest') or []
+            if nearest:
+                cid = nearest[0].get('cid')
+                _ensure_dfs()
+                if _beh_df is not None and cid in _beh_df.index:
+                    row = _beh_df.loc[cid]
+                    if hasattr(row, 'iloc') and not isinstance(row, pd.Series):
+                        row = row.iloc[0]
+                    props_dict = {str(col): int(bool(row[col])) for col in _beh_df.columns}
+        except Exception:
+            props_dict = {}
+        # Fallback: use descriptor-based top match to pick a molecule and use its properties
+        if not props_dict:
+            try:
+                matches = search_smile_by_description(desired_desc or [], top_n=1)
+                if matches:
+                    smi2 = matches[0].get('IsomericSMILES')
+                    _ensure_dfs()
+                    if _mol_df is not None and _beh_df is not None and smi2 is not None:
+                        # find CID by SMILES string
+                        cands = _mol_df.index[_mol_df['IsomericSMILES'] == smi2]
+                        if len(cands) > 0:
+                            cid = cands[0]
+                            if cid in _beh_df.index:
+                                row = _beh_df.loc[cid]
+                                if hasattr(row, 'iloc') and not isinstance(row, pd.Series):
+                                    row = row.iloc[0]
+                                props_dict = {str(col): int(bool(row[col])) for col in _beh_df.columns}
+            except Exception:
+                props_dict = {}
+
+        # build vector
+        vec = [float(props_dict.get(col, 0)) for col in behavior_cols]
+        return props_dict, vec
+
     iter_count = 0
     while len(generated) < target_n and iter_count < max_iters:
         iter_count += 1
@@ -213,7 +274,6 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
             n=batch_per_call,
             desc=", ".join(descriptors),
             d=len(behavior_cols),
-            vec=json.dumps(target_vec_list),
             cols=json.dumps(behavior_cols),
         )
         messages = [system_msg, {"role": "user", "content": prompt}]
@@ -326,11 +386,16 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
             except Exception:
                 novel_flag = False
 
+            # Assign odor labels from nearest neighbor for retraining
+            props_dict, label_vec = _assign_properties_from_nearest(smi, descriptors)
+
             record = {
                 "smiles": smi,
                 "valid": bool(valid),
                 "novelty": novelty_info,
                 "odor_matches": odor_matches,
+                "assigned_properties": props_dict,
+                "assigned_vector": label_vec,
                 "timestamp": time.time(),
             }
 
@@ -338,13 +403,6 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
             if valid and novel_flag:
                 generated.append(record)
                 generated_set.add(smi)
-                # add fingerprint into replay buffer if RDKit available
-                try:
-                    fps = train_rl.build_fingerprints([smi])
-                    fp = fps[0] if fps else None
-                    replay.add(smi, fp)
-                except Exception:
-                    replay.add(smi, None)
                 print(f"Accepted novel SMILES ({len(generated)}/{target_n}): {smi}")
             else:
                 # still log the candidate
@@ -362,88 +420,112 @@ def generate_novel_smiles(descriptors: List[str], target_n: int = 100, batch_per
     except Exception as e:
         print("Failed to save generated SMILES:", e)
 
-    # Save replay buffer as a lightweight checkpoint so RL can pick it up
-    gen_ckpt = os.path.join("checkpoints", "generated_latest.pt")
-    try:
-        os.makedirs(os.path.dirname(gen_ckpt), exist_ok=True)
-        train_rl.save_checkpoint(gen_ckpt, model=None, optimizer=None, replay=replay, step=0)
-        print(f"Saved generated replay checkpoint to {gen_ckpt}")
-    except Exception as e:
-        print("Failed to save generated checkpoint:", e)
-
-    # Optionally run training (this will use train_rl.load code which reads GENERATED_SMILES_FILE)
-    if run_training:
-        # Set env var so train_rl.load_smiles will include these generated smiles
-        env = os.environ.copy()
-        env["GENERATED_SMILES_FILE"] = os.path.abspath(out_path)
-        # pass target behavior vector and descriptors for RL behavior reward
-        try:
-            env["TARGET_BEHAVIOR_VECTOR_JSON"] = json.dumps(target_vec_list)
-            env["TARGET_DESCRIPTORS"] = ",".join(descriptors)
-        except Exception:
-            pass
-        cmd = f"python {os.path.join(os.getcwd(), 'train_rl.py')}"
-        print("Starting RL training subprocess (this will run train_rl.py in a new terminal)")
-        try:
-            # Launch training in the background so this command returns
-            import subprocess
-            p = subprocess.Popen(cmd, shell=True, env=env)
-            print(f"Launched train_rl.py (pid={p.pid})")
-        except Exception as e:
-            print("Failed to launch training subprocess:", e)
-
     return generated
 
 
-def _run_training_and_capture(env: Dict[str, str], timeout: int = 60 * 60 * 3) -> Dict:
-    """Run train_rl.py synchronously with provided env and capture stdout/stderr.
+def _train_predictor_from_dfs(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.DataFrame, label_cols: List[str], cfg: PredictorConfig, ckpt_name: str) -> Dict:
+    """Train the Leffingwell predictor using provided splits and return metrics/report dict.
 
-    Returns a dict containing 'stdout' (str), 'stderr' (str), and parsed metrics.
+    Saves checkpoint and report similarly to leffingwell_odor_model.train_model but on custom splits.
     """
-    cmd = [shlex.quote(os.path.join(os.getcwd(), 'train_rl.py'))]
-    full_cmd = f"python {cmd[0]}"
-    try:
-        proc = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-    except Exception as e:
-        return {"stdout": "", "stderr": str(e), "metrics": {}}
+    # Build dataloaders
+    feat = SmilesFeaturizer(n_bits=cfg.fingerprint_size, radius=cfg.fingerprint_radius)
 
-    metrics = {}
-    # parse avg_reward lines
-    avg_rewards = re.findall(r"avg_reward=(\d+\.\d+)", out)
-    if avg_rewards:
-        try:
-            metrics['final_avg_reward'] = float(avg_rewards[-1])
-        except Exception:
-            pass
+    X_train = feat.featurize(df_train['SMILES'].tolist())
+    y_train = df_train[label_cols].values.astype(np.float32)
+    X_val = feat.featurize(df_val['SMILES'].tolist())
+    y_val = df_val[label_cols].values.astype(np.float32)
+    X_test = feat.featurize(df_test['SMILES'].tolist())
+    y_test = df_test[label_cols].values.astype(np.float32)
 
-    # parse novelty buffer size
-    buf_sizes = re.findall(r"novelty_buf=(\d+)", out)
-    if buf_sizes:
-        try:
-            metrics['novelty_buf'] = int(buf_sizes[-1])
-        except Exception:
-            pass
+    # Minimal in-place dataset to avoid reusing torch Dataset class
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+    import torch.nn.functional as F
 
-    # capture example molecules after RL
-    examples = []
-    m = re.search(r"Example molecules \(after RL\):\n([\s\S]*)", out)
-    if m:
-        block = m.group(1)
-        # stop at next blank line or end
-        for line in block.splitlines():
-            line = line.strip()
-            if not line:
-                break
-            # likely a SMILES string
-            examples.append(line)
-    metrics['examples_after_rl'] = examples
+    dl_train = DataLoader(TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)), batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
+    dl_val = DataLoader(TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)), batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+    dl_test = DataLoader(TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test)), batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
-    return {"stdout": out, "stderr": err, "metrics": metrics}
+    # Model
+    in_dim = cfg.fingerprint_size
+    out_dim = len(label_cols)
+    model = MLP(in_dim, out_dim, hidden=cfg.hidden_sizes, dropout=cfg.dropout).to(cfg.device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    best_state = None
+    best_val_loss = float('inf')
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        total = 0.0
+        steps = 0
+        for xb, yb in dl_train:
+            xb = xb.to(cfg.device)
+            yb = yb.to(cfg.device)
+            logits = model(xb)
+            loss = F.binary_cross_entropy_with_logits(logits, yb, reduction='mean')
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            total += loss.item()
+            steps += 1
+        train_loss = total / max(steps, 1)
+        val_loss, val_f1_micro, val_f1_macro = evaluate_predictor(model, dl_val, cfg.device)
+        print(f"[Predictor] Epoch {epoch:03d}/{cfg.epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_f1_micro={val_f1_micro:.4f} val_f1_macro={val_f1_macro:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu() if hasattr(v, 'device') else v for k, v in model.state_dict().items()}
+
+    # Load best state
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Final test evaluation
+    test_loss, test_f1_micro, test_f1_macro = evaluate_predictor(model, dl_test, cfg.device)
+
+    # Save
+    os.makedirs(cfg.ckpt_dir, exist_ok=True)
+    os.makedirs(cfg.report_dir, exist_ok=True)
+    ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
+    torch.save({
+        'config': cfg.__dict__,
+        'model_state': model.state_dict(),
+        'n_inputs': in_dim,
+        'n_labels': out_dim,
+        'arch': {
+            'hidden': list(cfg.hidden_sizes),
+            'dropout': cfg.dropout,
+        },
+        'label_names': label_cols,
+        'featurizer': {
+            'type': 'rdkit_morgan' if feat.use_rdkit else 'ngram_hash',
+            'n_bits': feat.n_bits,
+            'radius': feat.radius,
+        },
+        'best_val': {
+            'loss': best_val_loss,
+        },
+    }, ckpt_path)
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    report = {
+        'timestamp': timestamp,
+        'train_size': len(df_train),
+        'val_size': len(df_val),
+        'test_size': len(df_test),
+        'test': {
+            'loss': test_loss,
+            'f1_micro': test_f1_micro,
+            'f1_macro': test_f1_macro,
+        },
+        'ckpt_path': ckpt_path,
+    }
+    report_path = os.path.join(cfg.report_dir, f"leffingwell_eval_{timestamp}.json")
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return report
 
 
 def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: Dict, recent_generated: List[Dict]) -> Dict:
@@ -483,17 +565,13 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
                 "strict": True,
                 "description": "A tool that searches for SMILES strings based on valid descriptors for Leffingwell dataset.",
                 "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "expression": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "valid descriptors for Leffingwell dataset."
-                        },
-                        "top_n": {"type": "integer", "minimum": 1, "default": 10}
-                    },
-                    "required": ["expression"]
-                }
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid descriptors for Leffingwell dataset."
+                    }
+                },
+                "required": ["expression"]
             }
         },
         {
@@ -503,17 +581,13 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
                 "strict": True,
                 "description": "A tool that searches for similar molecule and their descriptors based on SMILES strings from Leffingwell dataset.",
                 "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "smiles": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "valid SMILES strings"
-                        },
-                        "top_n": {"type": "integer", "minimum": 1, "default": 10}
-                    },
-                    "required": ["smiles"]
-                }
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "valid SMILES strings"
+                    }
+                },
+                "required": ["smiles"]
             }
         }
     ]
@@ -545,11 +619,6 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
                 tool_content = json.dumps({"error": "Unknown tool"})
                 if fn.name == "search_smile_by_description":
                     args = getattr(fn, 'arguments', {})
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
                     descs = args.get("expression") if isinstance(args, dict) else None
                     if isinstance(descs, list):
                         try:
@@ -561,11 +630,6 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
                         tool_content = json.dumps({"error": "Invalid arguments format"})
                 elif fn.name == "search_description_by_smiles":
                     args = getattr(fn, 'arguments', {})
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
                     smis = args.get("smiles") if isinstance(args, dict) else None
                     if isinstance(smis, list):
                         try:
@@ -612,8 +676,9 @@ def ask_llm_for_adjustments(client: Cerebras, descriptors: List[str], metrics: D
 
 
 def orchestrate(descriptors: List[str], rounds: int = 3, per_round_target: int = 50):
-    """High-level loop: generate -> train -> analyze -> adjust -> repeat.
+    """High-level loop: generate -> retrain predictor -> analyze -> adjust -> repeat.
 
+    This now augments and retrains the Leffingwell predictor instead of RL generation.
     - descriptors: initial target descriptors
     - rounds: number of generation-training rounds
     - per_round_target: number of novel molecules to collect per round
@@ -635,32 +700,40 @@ def orchestrate(descriptors: List[str], rounds: int = 3, per_round_target: int =
             print("Failed to auto-select descriptors:", e)
     for r in range(rounds):
         print(f"=== Round {r+1}/{rounds}: descriptors={current_descriptors} ===")
-        gen = generate_novel_smiles(current_descriptors, target_n=per_round_target, batch_per_call=5, run_training=False)
+        gen = generate_novel_smiles(current_descriptors, target_n=per_round_target, batch_per_call=5)
         all_generated.extend(gen)
 
-        # write generated to file and set env for training
+        # write generated to file
         out_path = os.path.abspath(os.environ.get("GENERATED_SMILES_FILE", "generated_smiles.json"))
         with open(out_path, 'w') as f:
             json.dump(all_generated, f, indent=2)
 
-        env = os.environ.copy()
-        env["GENERATED_SMILES_FILE"] = out_path
-        # Provide target behavior vector for RL reward
+        # Retrain predictor on augmented data and evaluate
+        print("Retraining predictor with newly generated molecules...")
         try:
-            behavior_cols = get_behavior_columns()
-            target_vec = vector_from_descriptors(current_descriptors)
-            env["TARGET_BEHAVIOR_VECTOR_JSON"] = json.dumps(target_vec.tolist())
-            # allow tuning weight via env if set externally; default is defined in train_rl
-            if "BEHAVIOR_REWARD_WEIGHT" not in env:
-                env["BEHAVIOR_REWARD_WEIGHT"] = "0.3"
-        except Exception:
-            pass
-
-        print("Running training with newly generated molecules...")
-        res = _run_training_and_capture(env)
-        print("Training finished; parsing metrics...")
-        metrics = res.get('metrics', {})
-        print("Parsed metrics:", metrics)
+            base_df, label_cols = load_leffingwell_dataframe()
+            # Build generated df rows with labels
+            rows = []
+            for rec in gen:
+                if not rec.get('valid'):
+                    continue
+                vec = rec.get('assigned_vector') or []
+                if not vec or len(vec) != len(label_cols):
+                    continue
+                row = {'SMILES': rec['smiles']}
+                row.update({c: int(v >= 0.5) for c, v in zip(label_cols, vec)})
+                rows.append(row)
+            gen_df = pd.DataFrame(rows)
+            # Use the same split seed and holdout; augment the training split only
+            df_train, df_val, df_test = split_df(base_df, train_ratio=0.8, val_ratio=0.1)
+            df_train_aug = pd.concat([df_train, gen_df], ignore_index=True) if not gen_df.empty else df_train
+            cfg = PredictorConfig(epochs=5, ckpt_name='leffingwell_augmented.pt')
+            report = _train_predictor_from_dfs(df_train_aug, df_val, df_test, label_cols, cfg, ckpt_name=cfg.ckpt_name)
+            metrics = report.get('test', {})
+        except Exception as e:
+            print("Predictor retraining failed:", e)
+            metrics = {}
+        print("Predictor metrics:", metrics)
 
         # Ask LLM for adjustments
         suggestion = ask_llm_for_adjustments(client, current_descriptors, metrics, gen)
@@ -767,101 +840,104 @@ def _compute_validity_novelty(records: List[Dict]) -> Dict[str, float]:
 
 
 def run_controlled_experiment(descriptors: List[str], llm_rounds: int = 2, per_round_target: int = 50, control_n: int = 150):
-    """Run a control-group experiment:
-      1) Create a pretrained checkpoint (PRETRAIN_ONLY)
-      2) Run the LLM-orchestrated pipeline starting from that checkpoint
-      3) Run a control pipeline that uses `control_n` random SMILES (no rejection)
-      4) Compare final metrics from both runs
+    """Control-group experiment for predictor retraining:
+      1) Train a baseline predictor on the Leffingwell dataset (and record test F1)
+      2) Generate molecules with LLM, label by nearest neighbor, augment training set, retrain predictor
+      3) Control: sample random molecules from dataset, label by nearest neighbor (trivial), augment, retrain
+      4) Compare predictor test metrics between LLM-augmented and control-augmented runs
     """
-    # 1) Create pretrained checkpoint
-    pretrain_ckpt = os.path.abspath(os.path.join('checkpoints', 'pretrained.pt'))
-    env = os.environ.copy()
-    env['PRETRAIN_ONLY'] = '1'
-    env['PRETRAIN_SAVE_PATH'] = pretrain_ckpt
-    env['NUM_SMILES'] = str(2000)
-    print("Creating pretrained checkpoint (this will run train_rl.py PRETRAIN_ONLY)...")
-    res = _run_training_and_capture(env, timeout=60*60)
-    print("Pretraining stdout (truncated):\n", '\n'.join(res['stdout'].splitlines()[-20:]))
+    # Baseline split
+    base_df, label_cols = load_leffingwell_dataframe()
 
-    # 2) LLM-orchestrated run: set SKIP_PRETRAIN so train_rl uses pretrained checkpoint
-    print("Starting LLM-orchestrated experiment from pretrained checkpoint...")
+    def _robust_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        t, v, te = split_df(df, train_ratio=0.8, val_ratio=0.1)
+        # Ensure val/test have at least 1 row if possible
+        remaining = df
+        if len(v) == 0 and len(df) > 2:
+            v = df.sample(n=1, random_state=42)
+        if len(te) == 0 and len(df) > 2:
+            te = df.drop(v.index).sample(n=1, random_state=43) if len(df.drop(v.index)) > 0 else v
+        # Rebuild train as the rest
+        t = df.drop(v.index.union(te.index)) if len(v) + len(te) < len(df) else df
+        return t.reset_index(drop=True), v.reset_index(drop=True), te.reset_index(drop=True)
+
+    df_train, df_val, df_test = _robust_split(base_df)
+
+    print("Training baseline predictor...")
+    base_cfg = PredictorConfig(epochs=1, ckpt_name='leffingwell_base.pt')
+    base_report = _train_predictor_from_dfs(df_train, df_val, df_test, label_cols, base_cfg, ckpt_name=base_cfg.ckpt_name)
+    print("Baseline test:", base_report.get('test', {}))
+
+    # LLM-augmented
+    print("Generating LLM-augmented molecules...")
     llm_out_path = os.path.abspath('generated_llm.json')
-    os.environ['GENERATED_SMILES_FILE'] = llm_out_path
     all_generated = []
     current_desc = descriptors
     client = Cerebras(api_key=os.environ.get("CEREBRAS_API_KEY"))
     for r in range(llm_rounds):
-        gen = generate_novel_smiles(current_desc, target_n=per_round_target, batch_per_call=5, run_training=False)
+        gen = generate_novel_smiles(current_desc, target_n=per_round_target, batch_per_call=5)
         all_generated.extend(gen)
         with open(llm_out_path, 'w') as f:
             json.dump(all_generated, f, indent=2)
 
-    env_llm = os.environ.copy()
-    env_llm['GENERATED_SMILES_FILE'] = llm_out_path
-    env_llm['SKIP_PRETRAIN'] = '1'
-    env_llm['PRETRAIN_SAVE_PATH'] = pretrain_ckpt
-    # Provide behavior target vector for RL conditioning
-    try:
-        from libserach import vector_from_descriptors
-        tgt_vec = vector_from_descriptors(current_desc)
-        env_llm['TARGET_BEHAVIOR_VECTOR_JSON'] = json.dumps(tgt_vec.tolist())
-        if 'BEHAVIOR_REWARD_WEIGHT' not in env_llm:
-            env_llm['BEHAVIOR_REWARD_WEIGHT'] = '0.3'
-    except Exception:
-        pass
-    # ensure train_rl.load_checkpoint picks up pretrained checkpoint by loading it into latest.pt
-    try:
-        import shutil
-        os.makedirs('checkpoints', exist_ok=True)
-        shutil.copy(pretrain_ckpt, os.path.join('checkpoints', 'latest.pt'))
-    except Exception:
-        pass
-    res_llm = _run_training_and_capture(env_llm)
-    metrics_llm = res_llm.get('metrics', {})
-    print("LLM experiment metrics:", metrics_llm)
+    # Build augmentation df from generated
+    gen_rows = []
+    for rec in all_generated:
+        if not rec.get('valid'):
+            continue
+        vec = rec.get('assigned_vector') or []
+        if not vec or len(vec) != len(label_cols):
+            continue
+        row = {'SMILES': rec['smiles']}
+        row.update({c: int(v >= 0.5) for c, v in zip(label_cols, vec)})
+        gen_rows.append(row)
+    gen_df = pd.DataFrame(gen_rows)
+    df_train_llm = pd.concat([df_train, gen_df], ignore_index=True) if not gen_df.empty else df_train
+    print(f"LLM augmentation size: {len(gen_df)}")
+    llm_cfg = PredictorConfig(epochs=1, ckpt_name='leffingwell_llm_aug.pt')
+    report_llm = _train_predictor_from_dfs(df_train_llm, df_val, df_test, label_cols, llm_cfg, ckpt_name=llm_cfg.ckpt_name)
+    metrics_llm = report_llm.get('test', {})
+    print("LLM-augmented test:", metrics_llm)
 
-    # 3) Control: random sample, no rejection
+    # Control augmentation: random molecules (no rejection)
     print(f"Creating control group of {control_n} random molecules (no rejection)...")
     control_list = _sample_random_control(control_n)
     control_path = os.path.abspath('generated_control.json')
     with open(control_path, 'w') as f:
         json.dump(control_list, f, indent=2)
 
-    env_ctrl = os.environ.copy()
-    env_ctrl['GENERATED_SMILES_FILE'] = control_path
-    env_ctrl['SKIP_PRETRAIN'] = '1'
-    # ensure starting from same pretrained checkpoint
-    try:
-        shutil.copy(pretrain_ckpt, os.path.join('checkpoints', 'latest.pt'))
-    except Exception:
-        pass
-    res_ctrl = _run_training_and_capture(env_ctrl)
-    metrics_ctrl = res_ctrl.get('metrics', {})
-    print("Control experiment metrics:", metrics_ctrl)
+    # Label control molecules via nearest neighbor too (though from dataset, it will mirror true labels)
+    ctrl_rows = []
+    for rec in control_list:
+        smi = rec['smiles']
+        try:
+            nn = search_description_by_smiles([smi], top_n=1)
+            props = (nn[0].get('properties') if nn else {}) or {}
+            row = {'SMILES': smi}
+            row.update({c: int(bool(props.get(c, 0))) for c in label_cols})
+            ctrl_rows.append(row)
+        except Exception:
+            continue
+    ctrl_df = pd.DataFrame(ctrl_rows)
+    df_train_ctrl = pd.concat([df_train, ctrl_df], ignore_index=True) if not ctrl_df.empty else df_train
+    print(f"Control augmentation size: {len(ctrl_df)}")
+    ctrl_cfg = PredictorConfig(epochs=1, ckpt_name='leffingwell_ctrl_aug.pt')
+    report_ctrl = _train_predictor_from_dfs(df_train_ctrl, df_val, df_test, label_cols, ctrl_cfg, ckpt_name=ctrl_cfg.ckpt_name)
+    metrics_ctrl = report_ctrl.get('test', {})
+    print("Control-augmented test:", metrics_ctrl)
 
-    # Compute and display validity and novelty for both generated sets
+    # Quality of generated molecules
     llm_gen_metrics = _compute_validity_novelty(all_generated)
     ctrl_gen_metrics = _compute_validity_novelty(control_list)
     print("\n=== Generation quality (validity/novelty) ===")
-    print(
-        "LLM generated: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(
-            **llm_gen_metrics
-        )
-    )
-    print(
-        "Control sample: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(
-            **ctrl_gen_metrics
-        )
-    )
+    print("LLM generated: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(**llm_gen_metrics))
+    print("Control sample: n={n}, valid={valid} ({valid_rate:.1%}), novel={novel} ({novel_rate:.1%})".format(**ctrl_gen_metrics))
 
-    # 4) Compare
-    print("\n=== Comparison ===")
-    print("LLM experiment final_avg_reward:", metrics_llm.get('final_avg_reward'))
-    print("Control experiment final_avg_reward:", metrics_ctrl.get('final_avg_reward'))
-    print("LLM novelty_buf:", metrics_llm.get('novelty_buf'))
-    print("Control novelty_buf:", metrics_ctrl.get('novelty_buf'))
-    print("LLM examples_after_rl (sample):", metrics_llm.get('examples_after_rl', [])[:5])
-    print("Control examples_after_rl (sample):", metrics_ctrl.get('examples_after_rl', [])[:5])
+    # Comparison
+    print("\n=== Predictor comparison ===")
+    print("Baseline f1_micro:", base_report.get('test', {}).get('f1_micro'))
+    print("LLM-augmented f1_micro:", metrics_llm.get('f1_micro'))
+    print("Control-augmented f1_micro:", metrics_ctrl.get('f1_micro'))
 
 if __name__ == "__main__":
     init()
