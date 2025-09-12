@@ -98,14 +98,19 @@ async def main(run_iteration=1):
 
 
 if __name__ == "__main__":
+    current_training_data = []
+
     for i in range(10):
-        # Obtained new molecules from the model
+        # Obtained new molecules from the agent
         new_mol_to_use = asyncio.run(main(run_iteration=i))
 
         # Retrain the model with the new molecules
         # retrain_model(new_mol_to_use)  # This function needs to be defined
 
+        # Calculate and save model performance metrics
+        # metrics = evaluate_model(model, validation_data)  # This function needs to be defined
+
         # Save the model
         # torch.save(model.state_dict(), f"smiles_model.pt")
 
-        # regenerate the latent vectors for the entire training set
+        # save the new latents and smiles to the correct files
