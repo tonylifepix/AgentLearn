@@ -6,6 +6,7 @@ from typing import List, Tuple
 import difflib
 import os
 import pickle
+import json
 
 try:
     from rdkit import Chem
@@ -36,6 +37,35 @@ def load_smiles(limit: int = None) -> List[str]:
     if mol is None or "IsomericSMILES" not in mol.columns:
         return []
     s = mol["IsomericSMILES"].dropna().astype(str).unique().tolist()
+    # Optionally extend dataset with externally-generated SMILES provided via
+    # the environment variable GENERATED_SMILES_FILE. The file may be JSON
+    # (list of SMILES) or plain text with one SMILES per line.
+    try:
+        gen_path = os.environ.get("GENERATED_SMILES_FILE")
+        if gen_path and os.path.exists(gen_path):
+            try:
+                with open(gen_path, 'r') as f:
+                    data = f.read()
+                try:
+                    extra = json.loads(data)
+                    if isinstance(extra, str):
+                        extra = [extra]
+                    extra = [str(x).strip() for x in extra if x]
+                except Exception:
+                    # fallback to newline-split
+                    extra = [l.strip() for l in data.splitlines() if l.strip()]
+
+                # append unique extras not already in dataset
+                for smi in extra:
+                    if smi not in s:
+                        s.append(smi)
+                if len(extra) > 0:
+                    print(f"Loaded {len(extra)} extra generated SMILES from {gen_path}")
+            except Exception:
+                # don't fail dataset loading if extra file is malformed
+                pass
+    except Exception:
+        pass
     if limit is not None and len(s) > limit:
         return random.sample(s, limit)
     return s
