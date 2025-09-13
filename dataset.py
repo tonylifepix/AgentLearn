@@ -19,9 +19,12 @@ def smiles_to_vec(smiles, vector_size=2048):
 
 
 class SmilesDataset(Dataset):
-    def __init__(self, smiles_list, properties):
+    def __init__(self, smiles_list, properties, vector_size=128):
+        """
+        Initialize the dataset with SMILES strings and their corresponding properties.
+        """
         self.smiles_list = smiles_list
-        self.vectors = [smiles_to_vec(smiles) for smiles in smiles_list]
+        self.vectors = [smiles_to_vec(smiles, vector_size) for smiles in smiles_list]
         self.properties = torch.from_numpy(properties)
 
     def __len__(self):
@@ -86,4 +89,11 @@ if __name__ == "__main__":
     torch.save(test_dataset, "test_dataset.pt")
 
     full_training_smiles = train_dataset.smiles_list
+    full_training_properties = train_dataset.properties.numpy()
     print(f"Full training SMILES count: {len(full_training_smiles)}")
+    with open("training_data_pool_full.pkl", "wb") as f:
+        import pickle
+
+        pickle.dump(full_training_smiles, f)
+
+    np.save("training_data_properties.npy", full_training_properties)

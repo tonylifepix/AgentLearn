@@ -5,7 +5,12 @@ from mcp.client.stdio import stdio_client
 import asyncio
 import os
 from contextlib import AsyncExitStack
+import pickle
+import numpy as np
 
+from train_model import _training_loop, retrain_model
+from dataset import SmilesDataset
+import time
 
 client_key = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=client_key)
@@ -30,17 +35,18 @@ async def main(run_iteration=1):
 
             print("Prompt: \n")
             chat_prompt = (
-                "Generate 5 new SMILES strings"
+                "Generate 1 new SMILES strings"
                 + " for molecules similar to the most unique molecule."
                 + " You can use the tools to find the most unique molecule."
                 + " For each molecules you suggest "
                 + " verify the SMILES,"
                 + " check if it already known/"
-                + " If not known, get similar molecules from the sample pool."
+                + " Get similar molecules from the sample pool."
                 + " If a molecule is known or doesn't fit the criteria, move on and"
                 + " generate a different one and try again."
-                + " The final output should just be a list of the unique molecules"
-                + " in the format [smiles1, smiles2, smiles3, smiles4, smiles5] \n\n"
+                + " Once you have found a new molecule, get similar molecules from the pool."
+                + " Return the list of molecules from the pool"
+                + " in the format smiles1, smiles2, smiles3, smiles4, smiles5 \n\n"
             )
             print(chat_prompt)
             prompt = chat_prompt
@@ -76,20 +82,20 @@ async def main(run_iteration=1):
                 if not part.text:
                     continue
                 if part.thought:
-                    print("Thought:", part.thought.text)
-                if part.tool_call:
-                    print("Tool call:", part.tool_call)
-                if part.tool_response:
-                    print("Tool response:", part.tool_response)
-                if part.text:
+                    print("Thought:", part.text)
+                else:
                     print("Text:", part.text)
-                    new_mols.append(part.text)
+                    try:
+                        smiles_list = part.text.strip().split(",")
+                        new_mols.extend(smiles_list)
+                    except Exception as e:
+                        print("Error:", e)
             print("Response text:", response.text)
             print("Response usage metadata:", response.usage_metadata)
             print("New molecules:", new_mols)
             print(
                 "New molecules list:",
-                [mol.strip() for mol in new_mols if mol.strip().startswith("C")],
+                [mol.strip() for mol in new_mols],
             )
             print("New molecules count:", len(new_mols))
             print("New molecules unique count:", len(set(new_mols)))
@@ -99,18 +105,91 @@ async def main(run_iteration=1):
 
 if __name__ == "__main__":
     current_training_data = []
+    # initialize with random set of molecules from training data
+    with open("training_data_pool_full.pkl", "rb") as f:
+        full_data = pickle.load(f)
+    # print(f"Full data size: {full_data}")
+    num_starting_mols = 200
+    full_training_properties = np.load("training_data_properties.npy")
+    current_training_data = full_data[:num_starting_mols]
+    current_training_properties = full_training_properties[:num_starting_mols, :]
 
+    smiles_to_prop_dict = {
+        smi: prop for smi, prop in zip(full_data, full_training_properties)
+    }
+
+    score, model = retrain_model(
+        current_training_data, current_training_properties, fname="smiles_model.pt"
+    )
+
+    remaining_data = full_data[num_starting_mols:]
+    remaining_properties = full_training_properties[num_starting_mols:, :]
+
+    remaining_latents = []
+    for smi in remaining_data:
+        latent = model.latent_representation(smi)
+        remaining_latents.append(latent)
+    remaining_latents = np.array(remaining_latents, dtype=np.float32)
+    np.save("remaining_training_data_latents.npy", remaining_latents)
+    np.save("remaining_training_data_properties.npy", remaining_properties)
+
+    with open("remaining_training_data_smiles.pkl", "wb") as f:
+        pickle.dump(remaining_data, f)
+
+    scores = [score]
     for i in range(10):
         # Obtained new molecules from the agent
         new_mol_to_use = asyncio.run(main(run_iteration=i))
 
+        # For testing, just use some random molecules from the pool
+        # new_mol_to_use = full_data[
+        #     num_starting_mols + i * 5 : num_starting_mols + (i + 1) * 5
+        # ]
+        print(f"New molecules to use for retraining: {new_mol_to_use}")
+
+        # Get properties for the new molecules
+        new_prop_list = []
+        filtered_new_mols = []
+        for smi in new_mol_to_use:
+            if smi in smiles_to_prop_dict:
+                if smi in remaining_data:
+                    new_prop_list.append(smiles_to_prop_dict[smi])
+                    remaining_data.remove(smi)
+                    filtered_new_mols.append(smi)
+        print(f"Filtered new molecules: {filtered_new_mols}")
+        if len(new_prop_list) < 1:
+            continue
+        new_prop_list = np.array(new_prop_list)
+
+        current_training_data.extend(filtered_new_mols)
+        current_training_properties = np.vstack(
+            [current_training_properties, new_prop_list]
+        )
+        if len(new_prop_list) == 0:
+            print("No new valid molecules found, skipping retraining.")
+            continue
+        print(f"New properties shape: {current_training_properties.shape}")
+
         # Retrain the model with the new molecules
-        # retrain_model(new_mol_to_use)  # This function needs to be defined
+        score, model = retrain_model(
+            current_training_data, current_training_properties, fname="smiles_model.pt"
+        )
+        scores.append(score)
 
-        # Calculate and save model performance metrics
-        # metrics = evaluate_model(model, validation_data)  # This function needs to be defined
+        remaining_latents = []
+        remaining_properties = []
+        for smi in remaining_data:
+            latent = model.latent_representation(smi)
+            remaining_latents.append(latent)
+            remaining_properties.append(smiles_to_prop_dict[smi])
+        remaining_properties = np.array(remaining_properties, dtype=np.float32)
+        np.save("remaining_training_data_properties.npy", remaining_properties)
+        remaining_latents = np.array(remaining_latents, dtype=np.float32)
+        np.save("remaining_training_data_latents.npy", remaining_latents)
 
-        # Save the model
-        # torch.save(model.state_dict(), f"smiles_model.pt")
+        with open("remaining_training_data_smiles.pkl", "wb") as f:
+            pickle.dump(remaining_data, f)
 
-        # save the new latents and smiles to the correct files
+        time.sleep(30)
+
+    print(f"Scores over iterations: {scores}")
